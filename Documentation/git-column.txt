@@ -9,7 +9,7 @@ SYNOPSIS
 --------
 [verse]
 'git column' [--command=<name>] [--[raw-]mode=<mode>] [--width=<width>]
-	     [--indent=<string>] [--nl=<string>] [--pading=<n>]
+	     [--indent=<string>] [--nl=<string>] [--padding=<n>]
 
 DESCRIPTION
 -----------
@@ -42,11 +42,6 @@ OPTIONS
 
 --padding=<N>::
 	The number of spaces between columns. One space by default.
-
-
-Author
-------
-Written by Nguyen Thai Ngoc Duy <pclouds@gmail.com>
 
 GIT
 ---

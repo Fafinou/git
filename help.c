@@ -6,14 +6,14 @@
 #include "common-cmds.h"
 #include "string-list.h"
 #include "column.h"
+#include "version.h"
+#include "refs.h"
 
 void add_cmdname(struct cmdnames *cmds, const char *name, int len)
 {
-	struct cmdname *ent = xmalloc(sizeof(*ent) + len + 1);
-
+	struct cmdname *ent;
+	FLEX_ALLOC_MEM(ent, name, name, len);
 	ent->len = len;
-	memcpy(ent->name, name, len);
-	ent->name[len] = 0;
 
 	ALLOC_GROW(cmds->names, cmds->cnt + 1, cmds->alloc);
 	cmds->names[cmds->cnt++] = ent;
@@ -43,9 +43,12 @@ static void uniq(struct cmdnames *cmds)
 	if (!cmds->cnt)
 		return;
 
-	for (i = j = 1; i < cmds->cnt; i++)
-		if (strcmp(cmds->names[i]->name, cmds->names[i-1]->name))
+	for (i = j = 1; i < cmds->cnt; i++) {
+		if (!strcmp(cmds->names[i]->name, cmds->names[j-1]->name))
+			free(cmds->names[i]);
+		else
 			cmds->names[j++] = cmds->names[i];
+	}
 
 	cmds->cnt = j;
 }
@@ -60,9 +63,10 @@ void exclude_cmds(struct cmdnames *cmds, struct cmdnames *excludes)
 		cmp = strcmp(cmds->names[ci]->name, excludes->names[ei]->name);
 		if (cmp < 0)
 			cmds->names[cj++] = cmds->names[ci++];
-		else if (cmp == 0)
-			ci++, ei++;
-		else if (cmp > 0)
+		else if (cmp == 0) {
+			ei++;
+			free(cmds->names[ci++]);
+		} else if (cmp > 0)
 			ei++;
 	}
 
@@ -72,8 +76,7 @@ void exclude_cmds(struct cmdnames *cmds, struct cmdnames *excludes)
 	cmds->cnt = cj;
 }
 
-static void pretty_print_string_list(struct cmdnames *cmds,
-				     unsigned int colopts)
+static void pretty_print_cmdnames(struct cmdnames *cmds, unsigned int colopts)
 {
 	struct string_list list = STRING_LIST_INIT_NODUP;
 	struct column_options copts;
@@ -101,10 +104,7 @@ static int is_executable(const char *name)
 	    !S_ISREG(st.st_mode))
 		return 0;
 
-#if defined(WIN32) || defined(__CYGWIN__)
-#if defined(__CYGWIN__)
-if ((st.st_mode & S_IXUSR) == 0)
-#endif
+#if defined(GIT_WINDOWS_NATIVE)
 {	/* cannot trust the executable bit, peek into the file instead */
 	char buf[3] = { 0 };
 	int n;
@@ -127,7 +127,6 @@ static void list_commands_in_dir(struct cmdnames *cmds,
 					 const char *path,
 					 const char *prefix)
 {
-	int prefix_len;
 	DIR *dir = opendir(path);
 	struct dirent *de;
 	struct strbuf buf = STRBUF_INIT;
@@ -137,15 +136,15 @@ static void list_commands_in_dir(struct cmdnames *cmds,
 		return;
 	if (!prefix)
 		prefix = "git-";
-	prefix_len = strlen(prefix);
 
 	strbuf_addf(&buf, "%s/", path);
 	len = buf.len;
 
 	while ((de = readdir(dir)) != NULL) {
-		int entlen;
+		const char *ent;
+		size_t entlen;
 
-		if (prefixcmp(de->d_name, prefix))
+		if (!skip_prefix(de->d_name, prefix, &ent))
 			continue;
 
 		strbuf_setlen(&buf, len);
@@ -153,11 +152,10 @@ static void list_commands_in_dir(struct cmdnames *cmds,
 		if (!is_executable(buf.buf))
 			continue;
 
-		entlen = strlen(de->d_name) - prefix_len;
-		if (has_extension(de->d_name, ".exe"))
-			entlen -= 4;
+		entlen = strlen(ent);
+		strip_suffix(ent, ".exe", &entlen);
 
-		add_cmdname(cmds, de->d_name + prefix_len, entlen);
+		add_cmdname(cmds, ent, entlen);
 	}
 	closedir(dir);
 	strbuf_release(&buf);
@@ -206,15 +204,54 @@ void list_commands(unsigned int colopts,
 		const char *exec_path = git_exec_path();
 		printf_ln(_("available git commands in '%s'"), exec_path);
 		putchar('\n');
-		pretty_print_string_list(main_cmds, colopts);
+		pretty_print_cmdnames(main_cmds, colopts);
 		putchar('\n');
 	}
 
 	if (other_cmds->cnt) {
 		printf_ln(_("git commands available from elsewhere on your $PATH"));
 		putchar('\n');
-		pretty_print_string_list(other_cmds, colopts);
+		pretty_print_cmdnames(other_cmds, colopts);
 		putchar('\n');
+	}
+}
+
+static int cmd_group_cmp(const void *elem1, const void *elem2)
+{
+	const struct cmdname_help *e1 = elem1;
+	const struct cmdname_help *e2 = elem2;
+
+	if (e1->group < e2->group)
+		return -1;
+	if (e1->group > e2->group)
+		return 1;
+	return strcmp(e1->name, e2->name);
+}
+
+void list_common_cmds_help(void)
+{
+	int i, longest = 0;
+	int current_grp = -1;
+
+	for (i = 0; i < ARRAY_SIZE(common_cmds); i++) {
+		if (longest < strlen(common_cmds[i].name))
+			longest = strlen(common_cmds[i].name);
+	}
+
+	qsort(common_cmds, ARRAY_SIZE(common_cmds),
+		sizeof(common_cmds[0]), cmd_group_cmp);
+
+	puts(_("These are common Git commands used in various situations:"));
+
+	for (i = 0; i < ARRAY_SIZE(common_cmds); i++) {
+		if (common_cmds[i].group != current_grp) {
+			printf("\n%s\n", _(common_cmd_groups[common_cmds[i].group]));
+			current_grp = common_cmds[i].group;
+		}
+
+		printf("   %s   ", common_cmds[i].name);
+		mput_char(' ', longest - strlen(common_cmds[i].name));
+		puts(_(common_cmds[i].help));
 	}
 }
 
@@ -232,11 +269,13 @@ static struct cmdnames aliases;
 
 static int git_unknown_cmd_config(const char *var, const char *value, void *cb)
 {
+	const char *p;
+
 	if (!strcmp(var, "help.autocorrect"))
 		autocorrect = git_config_int(var,value);
 	/* Also use aliases for command lookup */
-	if (!prefixcmp(var, "alias."))
-		add_cmdname(&aliases, var + 6, strlen(var + 6));
+	if (skip_prefix(var, "alias.", &p))
+		add_cmdname(&aliases, p, strlen(p));
 
 	return git_default_config(var, value, cb);
 }
@@ -286,7 +325,7 @@ const char *help_unknown_cmd(const char *cmd)
 	add_cmd_list(&main_cmds, &aliases);
 	add_cmd_list(&main_cmds, &other_cmds);
 	qsort(main_cmds.names, main_cmds.cnt,
-	      sizeof(main_cmds.names), cmdname_compare);
+	      sizeof(*main_cmds.names), cmdname_compare);
 	uniq(&main_cmds);
 
 	/* This abuses cmdname->len for levenshtein distance */
@@ -309,7 +348,7 @@ const char *help_unknown_cmd(const char *cmd)
 		if ((n < ARRAY_SIZE(common_cmds)) && !cmp) {
 			/* Yes, this is one of the common commands */
 			n++; /* use the entry from common_cmds[] */
-			if (!prefixcmp(candidate, cmd)) {
+			if (starts_with(candidate, cmd)) {
 				/* Give prefix match a very good score */
 				main_cmds.names[i]->len = 0;
 				continue;
@@ -317,7 +356,7 @@ const char *help_unknown_cmd(const char *cmd)
 		}
 
 		main_cmds.names[i]->len =
-			levenshtein(cmd, candidate, 0, 2, 1, 4) + 1;
+			levenshtein(cmd, candidate, 0, 2, 1, 3) + 1;
 	}
 
 	qsort(main_cmds.names, main_cmds.cnt,
@@ -353,7 +392,7 @@ const char *help_unknown_cmd(const char *cmd)
 		if (autocorrect > 0) {
 			fprintf_ln(stderr, _("in %0.1f seconds automatically..."),
 				(float)autocorrect/10.0);
-			poll(NULL, 0, autocorrect * 100);
+			sleep_millisec(autocorrect * 100);
 		}
 		return assumed;
 	}
@@ -375,6 +414,60 @@ const char *help_unknown_cmd(const char *cmd)
 
 int cmd_version(int argc, const char **argv, const char *prefix)
 {
+	/*
+	 * The format of this string should be kept stable for compatibility
+	 * with external projects that rely on the output of "git version".
+	 */
 	printf("git version %s\n", git_version_string);
 	return 0;
+}
+
+struct similar_ref_cb {
+	const char *base_ref;
+	struct string_list *similar_refs;
+};
+
+static int append_similar_ref(const char *refname, const struct object_id *oid,
+			      int flags, void *cb_data)
+{
+	struct similar_ref_cb *cb = (struct similar_ref_cb *)(cb_data);
+	char *branch = strrchr(refname, '/') + 1;
+	const char *remote;
+
+	/* A remote branch of the same name is deemed similar */
+	if (skip_prefix(refname, "refs/remotes/", &remote) &&
+	    !strcmp(branch, cb->base_ref))
+		string_list_append(cb->similar_refs, remote);
+	return 0;
+}
+
+static struct string_list guess_refs(const char *ref)
+{
+	struct similar_ref_cb ref_cb;
+	struct string_list similar_refs = STRING_LIST_INIT_NODUP;
+
+	ref_cb.base_ref = ref;
+	ref_cb.similar_refs = &similar_refs;
+	for_each_ref(append_similar_ref, &ref_cb);
+	return similar_refs;
+}
+
+void help_unknown_ref(const char *ref, const char *cmd, const char *error)
+{
+	int i;
+	struct string_list suggested_refs = guess_refs(ref);
+
+	fprintf_ln(stderr, _("%s: %s - %s"), cmd, ref, error);
+
+	if (suggested_refs.nr > 0) {
+		fprintf_ln(stderr,
+			   Q_("\nDid you mean this?",
+			      "\nDid you mean one of these?",
+			      suggested_refs.nr));
+		for (i = 0; i < suggested_refs.nr; i++)
+			fprintf(stderr, "\t%s\n", suggested_refs.items[i].string);
+	}
+
+	string_list_clear(&suggested_refs, 0);
+	exit(1);
 }
